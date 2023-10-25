@@ -56,7 +56,8 @@ def _compute_flattened_scale(
     kernel,
     index_points,
     cholesky_fn,
-    observation_noise_variance=None):
+    observation_noise_variance=None,
+    task_observation_noise_variance=None):
   """Computes a matrix square root of the flattened covariance matrix.
 
   Given a multi-task kernel `k`, computes a matrix square root of the
@@ -95,13 +96,25 @@ def _compute_flattened_scale(
   """
   # This is of shape KN x KN, where K is the number of outputs
   kernel_matrix = kernel.matrix_over_all_tasks(index_points, index_points)
-  if observation_noise_variance is None:
+  if observation_noise_variance is None and task_observation_noise_variance is None:
     return cholesky_util.cholesky_from_fn(kernel_matrix, cholesky_fn)
+  elif observation_noise_variance is not None:
+    observation_noise_variance = tf.convert_to_tensor(observation_noise_variance)
+    observation_noise_var_diag = observation_noise_variance[:, tf.newaxis]
+  else:
+    assert task_observation_noise_variance is not None
+    n_task = task_observation_noise_variance.shape[-1]
+    n = kernel_matrix.shape[-1]
+    assert kernel_matrix.shape[-1] % n_task == 0
+    b_shape = (*task_observation_noise_variance.shape[:-1], n // n_task, n_task)
+    r_shape = (*task_observation_noise_variance.shape[:-1], n)
+    observation_noise_var_diag = tf.reshape(tf.broadcast_to(task_observation_noise_variance, b_shape), r_shape)
 
-  observation_noise_variance = tf.convert_to_tensor(observation_noise_variance)
 
   # We can add the observation noise to each block.
   if isinstance(kernel, multitask_kernel.Independent):
+    if observation_noise_variance is None:
+      raise NotImplementedError("Per-task observation noise variance is not yet supported with the `Independent` kernel")
     # The Independent kernel matrix is realized as a kronecker product of the
     # kernel over inputs, and an identity matrix per task (representing
     # independent tasks). Update the diagonal of the first matrix and take the
@@ -158,7 +171,7 @@ def _compute_flattened_scale(
             linear_operator_unitary.LinearOperatorUnitary(orth))
 
     full_diag = tf.linalg.LinearOperatorKronecker(kronecker_diags).diag_part()
-    full_diag = full_diag + observation_noise_variance[..., tf.newaxis]
+    full_diag = full_diag + observation_noise_var_diag
     scale_diag = tf.math.sqrt(full_diag)
     diag_operator = tf.linalg.LinearOperatorDiag(
         scale_diag,
@@ -179,12 +192,12 @@ def _compute_flattened_scale(
   kernel_matrix = kernel_matrix.to_dense()
   broadcast_shape = distribution_util.get_broadcast_shape(
       kernel_matrix,
-      observation_noise_variance[..., tf.newaxis, tf.newaxis])
+      observation_noise_var_diag[..., tf.newaxis])
   kernel_matrix = tf.broadcast_to(kernel_matrix, broadcast_shape)
   kernel_matrix = tf.linalg.set_diag(
       kernel_matrix,
       tf.linalg.diag_part(kernel_matrix) +
-      observation_noise_variance[..., tf.newaxis])
+      observation_noise_var_diag)
   kernel_matrix = tf.linalg.LinearOperatorFullMatrix(kernel_matrix)
   kernel_cholesky = cholesky_util.cholesky_from_fn(
       kernel_matrix, cholesky_fn)
@@ -199,6 +212,7 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
                index_points=None,
                mean_fn=None,
                observation_noise_variance=None,
+               task_observation_noise_variance=None,
                cholesky_fn=None,
                validate_args=False,
                allow_nan_stats=False,
@@ -246,6 +260,11 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
     """
     parameters = dict(locals())
     with tf.name_scope(name) as name:
+      if (observation_noise_variance is not None and
+           task_observation_noise_variance is not None):
+        raise ValueError(
+            'Expected only one of `observation_noise_variance` and '
+            '`task_observation_noise_variance`.')
       input_dtype = dtype_util.common_dtype(
           dict(
               kernel=kernel,
@@ -264,13 +283,17 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
                 kernel=kernel,
                 index_points=index_points,
                 observation_noise_variance=observation_noise_variance,
+                task_observation_noise_variance=task_observation_noise_variance,
             ),
             dtype_hint=tf.float32,
         )
         input_dtype = dtype
       else:
         dtype = dtype_util.common_dtype(
-            dict(observation_noise_variance=observation_noise_variance),
+            dict(
+              observation_noise_variance=observation_noise_variance,
+              task_observation_noise_variance=task_observation_noise_variance,
+            ),
             dtype_hint=tf.float32)
 
       if index_points is not None:
@@ -281,6 +304,10 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
           observation_noise_variance,
           dtype=dtype,
           name='observation_noise_variance')
+      task_observation_noise_variance = tensor_util.convert_nonref_to_tensor(
+          task_observation_noise_variance,
+          dtype=dtype,
+          name='task_observation_noise_variance')
 
       if not isinstance(kernel, multitask_kernel.MultiTaskKernel):
         raise ValueError('`kernel` must be a `MultiTaskKernel`.')
@@ -290,8 +317,10 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
       mean_fn = stochastic_process_util.maybe_create_multitask_mean_fn(
           mean_fn, kernel, dtype)
       self._mean_fn = mean_fn
-      # Scalar or vector the size of the number of tasks.
+      # Scalar
       self._observation_noise_variance = observation_noise_variance
+      # Vector the size of the number of tasks
+      self._task_observation_noise_variance = task_observation_noise_variance
 
       if cholesky_fn is None:
         self._cholesky_fn = cholesky_util.make_cholesky_with_jitter_fn()
@@ -363,6 +392,8 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
           'Expected that `self.index_points` is not `None`. Using '
           '`self.index_points=None` is equivalent to using a `GaussianProcess` '
           'prior, which this class encapsulates.')
+    if self.task_observation_noise_variance is not None:
+      raise ValueError("Per-task observation noise variance is not yet supported with `MultiTaskGaussianProcessRegressionModel`")
     argument_dict = {
         'kernel': self.kernel,
         'observation_index_points': self.index_points,
@@ -397,6 +428,10 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
     return self._observation_noise_variance
 
   @property
+  def task_observation_noise_variance(self):
+    return self._task_observation_noise_variance
+
+  @property
   def cholesky_fn(self):
     return self._cholesky_fn
 
@@ -413,6 +448,10 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
         observation_noise_variance=parameter_properties.ParameterProperties(
             event_ndims=0,
             shape_fn=lambda sample_shape: sample_shape[:-1],
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        task_observation_noise_variance=parameter_properties.ParameterProperties(
+            event_ndims=1,
             default_constraining_bijector_fn=(
                 lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))))
 
@@ -447,7 +486,8 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
           kernel=self.kernel,
           index_points=index_points,
           cholesky_fn=self._cholesky_fn,
-          observation_noise_variance=self.observation_noise_variance)
+          observation_noise_variance=self.observation_noise_variance,
+          task_observation_noise_variance=self.task_observation_noise_variance)
 
       batch_shape = self._batch_shape_tensor(index_points=index_points)
       event_shape = self._event_shape_tensor(index_points=index_points)
@@ -557,21 +597,22 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
     index_points = self._get_index_points(index_points)
     kernel_matrix = self.kernel.matrix_over_all_tasks(
         index_points, index_points)
-    observation_noise_variance = None
+    task_observation_noise_variance = None
+    if self.task_observation_noise_variance is not None:
+      task_observation_noise_variance = self.task_observation_noise_variance
     if self.observation_noise_variance is not None:
-      observation_noise_variance = tf.convert_to_tensor(
-          self.observation_noise_variance)
+      task_observation_noise_variance = tf.stack(
+        [tf.convert_to_tensor(self.observation_noise_variance)] * self.kernel.num_tasks, axis=-1)
 
     # We can add the observation noise to each block.
     if isinstance(self.kernel, multitask_kernel.Independent):
       single_task_variance = kernel_matrix.operators[0].diag_part()
-      if observation_noise_variance is not None:
-        single_task_variance = (
-            single_task_variance + observation_noise_variance[..., tf.newaxis])
       # Each task has the same variance, so shape this in to an `[..., e, t]`
       # shaped tensor and broadcast to batch shape
       variance = tf.stack(
           [single_task_variance] * self.kernel.num_tasks, axis=-1)
+      if task_observation_noise_variance is not None:
+        variance = variance + task_observation_noise_variance[..., tf.newaxis, :]
       # Finally broadcast with batch shape.
       batch_shape = self._batch_shape_tensor(index_points=index_points)
       event_shape = self._event_shape_tensor(index_points=index_points)
@@ -584,12 +625,9 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
     # of that structure. In the case of a `Separable` kernel, `diag_part` will
     # efficiently compute the diagonal of a kronecker product.
     variance = kernel_matrix.diag_part()
-    if observation_noise_variance is not None:
-      variance = (
-          variance +
-          observation_noise_variance[..., tf.newaxis])
-
     variance = _unvec(variance, [-1, self.kernel.num_tasks])
+    if task_observation_noise_variance is not None:
+      variance = variance + task_observation_noise_variance[..., tf.newaxis, :]
 
     # Finally broadcast with batch shape.
     batch_shape = self._batch_shape_tensor(index_points=index_points)
