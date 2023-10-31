@@ -56,6 +56,12 @@ def _add_diagonal_shift(m, c):
   return tf.linalg.set_diag(m, tf.linalg.diag_part(m) + c[..., tf.newaxis])
 
 
+def _add_task_diagonal_shift(m, c, num_tasks):
+  task_diag = c[..., tf.newaxis, :] + _unvec(
+      tf.linalg.diag_part(m), [-1, num_tasks])
+  return tf.linalg.set_diag(m, _vec(task_diag))
+
+
 def _flattened_conditional_mean_fn_helper(
     x,
     kernel,
@@ -98,6 +104,7 @@ def _compute_observation_scale(
     observation_index_points,
     cholesky_fn,
     observation_noise_variance=None,
+    task_observation_noise_variance=None,
     observations_is_missing=None):
   """Compute matrix square root of the kernel on observation index points."""
   if observations_is_missing is not None:
@@ -116,6 +123,9 @@ def _compute_observation_scale(
           observation_covariance, broadcast_shape)
       observation_covariance = _add_diagonal_shift(
           observation_covariance, observation_noise_variance)
+    elif task_observation_noise_variance is not None:
+      observation_covariance = _add_diagonal_shift(
+          observation_covariance, task_observation_noise_variance, kernel.num_tasks)
     vec_observations_is_missing = _vec(observations_is_missing)
     observation_covariance = tf.linalg.LinearOperatorFullMatrix(
         psd_kernels_util.mask_matrix(
@@ -130,7 +140,8 @@ def _compute_observation_scale(
         kernel=kernel,
         index_points=observation_index_points,
         cholesky_fn=cholesky_fn,
-        observation_noise_variance=observation_noise_variance)
+        observation_noise_variance=observation_noise_variance,
+        task_observation_noise_variance=task_observation_noise_variance)
 
   return observation_scale
 
@@ -207,7 +218,9 @@ class MultiTaskGaussianProcessRegressionModel(
                index_points=None,
                mean_fn=None,
                observation_noise_variance=None,
+               task_observation_noise_variance=None,
                predictive_noise_variance=None,
+               task_predictive_noise_variance=None,
                cholesky_fn=None,
                validate_args=False,
                allow_nan_stats=False,
@@ -291,6 +304,16 @@ class MultiTaskGaussianProcessRegressionModel(
 
       if not isinstance(kernel, multitask_kernel.MultiTaskKernel):
         raise ValueError('`kernel` must be a `MultiTaskKernel`.')
+      if (observation_noise_variance is not None and
+           task_observation_noise_variance is not None):
+        raise ValueError(
+            'Expected only one of `observation_noise_variance` and '
+            '`task_observation_noise_variance`.')
+      if (predictive_noise_variance is not None and
+           task_predictive_noise_variance is not None):
+        raise ValueError(
+            'Expected only one of `predictive_noise_variance` and '
+            '`task_predictive_noise_variance`.')
 
       input_dtype = dtype_util.common_dtype(
           dict(
@@ -314,7 +337,9 @@ class MultiTaskGaussianProcessRegressionModel(
                 observations=observations,
                 observation_index_points=observation_index_points,
                 observation_noise_variance=observation_noise_variance,
+                task_observation_noise_variance=task_observation_noise_variance,
                 predictive_noise_variance=predictive_noise_variance,
+                task_predictive_noise_variance=task_predictive_noise_variance,
             ),
             dtype_hint=tf.float32,
         )
@@ -324,7 +349,9 @@ class MultiTaskGaussianProcessRegressionModel(
             dict(
                 observations=observations,
                 observation_noise_variance=observation_noise_variance,
+                task_observation_noise_variance=task_observation_noise_variance,
                 predictive_noise_variance=predictive_noise_variance,
+                task_predictive_noise_variance=task_predictive_noise_variance,
             ), dtype_hint=tf.float32)
 
       if index_points is not None:
@@ -345,12 +372,23 @@ class MultiTaskGaussianProcessRegressionModel(
             observation_noise_variance,
             dtype=dtype,
             name='observation_noise_variance')
+      elif task_observation_noise_variance is not None:
+        task_observation_noise_variance = tensor_util.convert_nonref_to_tensor(
+            task_observation_noise_variance,
+            dtype=dtype,
+            name='task_observation_noise_variance')
       predictive_noise_variance = tensor_util.convert_nonref_to_tensor(
           predictive_noise_variance,
           dtype=dtype,
           name='predictive_noise_variance')
+      task_predictive_noise_variance = tensor_util.convert_nonref_to_tensor(
+          task_predictive_noise_variance,
+          dtype=dtype,
+          name='task_predictive_noise_variance')
       if predictive_noise_variance is None:
         predictive_noise_variance = observation_noise_variance
+      if task_predictive_noise_variance is None:
+        task_predictive_noise_variance = task_observation_noise_variance
       if cholesky_fn is None:
         self._cholesky_fn = cholesky_util.make_cholesky_with_jitter_fn()
       else:
@@ -365,7 +403,9 @@ class MultiTaskGaussianProcessRegressionModel(
           mean_fn, kernel, dtype)
       self._mean_fn = mean_fn
       self._observation_noise_variance = observation_noise_variance
+      self._task_observation_noise_variance = task_observation_noise_variance
       self._predictive_noise_variance = predictive_noise_variance
+      self._task_predictive_noise_variance = task_predictive_noise_variance
       self._index_ponts = index_points
       self._observation_index_points = observation_index_points
       self._observations = observations
@@ -382,6 +422,7 @@ class MultiTaskGaussianProcessRegressionModel(
               observation_index_points,
               self._cholesky_fn,
               observation_noise_variance=self.observation_noise_variance,
+              task_observation_noise_variance=self.task_observation_noise_variance,
               observations_is_missing=observations_is_missing)
 
           return _flattened_conditional_mean_fn_helper(
@@ -455,7 +496,9 @@ class MultiTaskGaussianProcessRegressionModel(
       observations_is_missing=None,
       index_points=None,
       observation_noise_variance=None,
+      task_observation_noise_variance=None,
       predictive_noise_variance=None,
+      task_predictive_noise_variance=None,
       mean_fn=None,
       cholesky_fn=None,
       validate_args=False,
@@ -576,13 +619,15 @@ class MultiTaskGaussianProcessRegressionModel(
                 kernel.feature_ndims, tf.float32))
         dtype = dtype_util.common_dtype(
             [observations, observation_noise_variance,
-             predictive_noise_variance], tf.float32)
+             task_observation_noise_variance,
+             predictive_noise_variance, task_predictive_noise_variance], tf.float32)
       else:
         # If the index points are not nested, we assume they are of the same
         # dtype as the kernel.
         dtype = dtype_util.common_dtype([
             kernel, index_points, observation_index_points, observations,
-            observation_noise_variance, predictive_noise_variance
+            observation_noise_variance, task_observation_noise_variance,
+            predictive_noise_variance, task_predictive_noise_variance
         ], tf.float32)
         input_dtype = dtype
 
@@ -593,6 +638,9 @@ class MultiTaskGaussianProcessRegressionModel(
       if observation_noise_variance is not None:
         observation_noise_variance = tf.convert_to_tensor(
             observation_noise_variance, dtype=dtype)
+      elif task_observation_noise_variance is not None:
+        task_observation_noise_variance = tf.convert_to_tensor(
+            task_observation_noise_variance, dtype=dtype)
       observations = tf.convert_to_tensor(observations, dtype=dtype)
 
       if observations_is_missing is not None:
@@ -639,6 +687,9 @@ class MultiTaskGaussianProcessRegressionModel(
                                                      broadcast_shape)
             observation_covariance = _add_diagonal_shift(
                 observation_covariance, observation_noise_variance)
+          elif task_observation_noise_variance is not None:
+            observation_covariance = _add_task_diagonal_shift(
+                observation_covariance, task_observation_noise_variance, kernel.num_tasks)
           observation_covariance = tf.linalg.LinearOperatorFullMatrix(
               psd_kernels_util.mask_matrix(
                   observation_covariance,
@@ -652,7 +703,8 @@ class MultiTaskGaussianProcessRegressionModel(
               kernel=kernel,
               index_points=observation_index_points,
               cholesky_fn=cholesky_fn,
-              observation_noise_variance=observation_noise_variance)
+              observation_noise_variance=observation_noise_variance,
+              task_observation_noise_variance=task_observation_noise_variance)
         solve_on_observations = observation_scale.solvevec(
             observation_scale.solvevec(vec_diff), adjoint=True)
 
@@ -674,7 +726,9 @@ class MultiTaskGaussianProcessRegressionModel(
           observations=observations,
           index_points=index_points,
           observation_noise_variance=observation_noise_variance,
+          task_observation_noise_variance=task_observation_noise_variance,
           predictive_noise_variance=predictive_noise_variance,
+          task_predictive_noise_variance=task_predictive_noise_variance,
           cholesky_fn=cholesky_fn,
           observations_is_missing=observations_is_missing,
           _flattened_conditional_mean_fn=flattened_conditional_mean_fn,
@@ -722,10 +776,18 @@ class MultiTaskGaussianProcessRegressionModel(
   @property
   def observation_noise_variance(self):
     return self._observation_noise_variance
+  
+  @property
+  def task_observation_noise_variance(self):
+    return self._task_observation_noise_variance
 
   @property
   def predictive_noise_variance(self):
     return self._predictive_noise_variance
+  
+  @property
+  def task_predictive_noise_variance(self):
+    return self._task_predictive_noise_variance
 
   @property
   def cholesky_fn(self):
@@ -757,9 +819,17 @@ class MultiTaskGaussianProcessRegressionModel(
             shape_fn=lambda sample_shape: sample_shape[:-1],
             default_constraining_bijector_fn=(
                 lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        task_observation_noise_variance=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
         predictive_noise_variance=parameter_properties.ParameterProperties(
             event_ndims=0,
             shape_fn=lambda sample_shape: sample_shape[:-1],
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        task_predictive_noise_variance=parameter_properties.ParameterProperties(
+            event_ndims=1,
             default_constraining_bijector_fn=(
                 lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
         _observation_scale=parameter_properties.BatchedComponentProperties())
@@ -806,6 +876,7 @@ class MultiTaskGaussianProcessRegressionModel(
           self.observation_index_points,
           self.cholesky_fn,
           observation_noise_variance=self.observation_noise_variance,
+          task_observation_noise_variance=self.task_observation_noise_variance,
           observations_is_missing=self.observations_is_missing)
 
     cholinv_kzx = observation_scale.solve(kxz, adjoint_arg=True)
@@ -813,15 +884,21 @@ class MultiTaskGaussianProcessRegressionModel(
         cholinv_kzx, cholinv_kzx, transpose_a=True)
 
     flattened_covariance = kxx.to_dense() - kxz_kzzinv_kzx
-    if self.predictive_noise_variance is None:
+    if self.predictive_noise_variance is None and self.task_predictive_noise_variance is None:
       return flattened_covariance
-    broadcast_shape = distribution_util.get_broadcast_shape(
-        flattened_covariance, self.predictive_noise_variance[..., tf.newaxis,
-                                                             tf.newaxis])
-    flattened_covariance = tf.broadcast_to(flattened_covariance,
-                                           broadcast_shape)
-    return _add_diagonal_shift(flattened_covariance,
-                               self.predictive_noise_variance)
+    elif self.predictive_noise_variance is not None:
+      broadcast_shape = distribution_util.get_broadcast_shape(
+          flattened_covariance, self.predictive_noise_variance[..., tf.newaxis,
+                                                              tf.newaxis])
+      flattened_covariance = tf.broadcast_to(flattened_covariance,
+                                            broadcast_shape)
+      return _add_diagonal_shift(flattened_covariance,
+                                self.predictive_noise_variance)
+    else:
+      assert self.task_predictive_noise_variance is not None
+      predictive_noise_variance = self.task_predictive_noise_variance
+      return _add_task_diagonal_shift(flattened_covariance,
+                               self.task_predictive_noise_variance, self.kernel.num_tasks)
 
   def _get_flattened_marginal_distribution(self, index_points=None):
     # This returns a MVN of event size [N * E], where N is the number of tasks
@@ -887,6 +964,9 @@ class MultiTaskGaussianProcessRegressionModel(
 
     variance = _unvec(flattened_variance, [-1, self.kernel.num_tasks])
 
+    if self.task_predictive_noise_variance is not None:
+      variance = (
+          variance + self.task_predictive_noise_variance)
     # Finally broadcast with batch shape.
     batch_shape = self._batch_shape_tensor(index_points=index_points)
     event_shape = self._event_shape_tensor(index_points=index_points)

@@ -392,8 +392,6 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
           'Expected that `self.index_points` is not `None`. Using '
           '`self.index_points=None` is equivalent to using a `GaussianProcess` '
           'prior, which this class encapsulates.')
-    if self.task_observation_noise_variance is not None:
-      raise ValueError("Per-task observation noise variance is not yet supported with `MultiTaskGaussianProcessRegressionModel`")
     argument_dict = {
         'kernel': self.kernel,
         'observation_index_points': self.index_points,
@@ -401,6 +399,7 @@ class MultiTaskGaussianProcess(distribution.AutoCompositeTensorDistribution):
         'observations': observations,
         'index_points': predictive_index_points,
         'observation_noise_variance': self.observation_noise_variance,
+        'task_observation_noise_variance': self.task_observation_noise_variance,
         'cholesky_fn': self.cholesky_fn,
         'mean_fn': self.mean_fn,
         'validate_args': self.validate_args,
